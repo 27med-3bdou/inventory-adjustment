@@ -17,6 +17,7 @@ class InventoryAdjustmentController extends Controller
             $request->integer('counted_quantity'),
             $request->string('reason')->trim()->toString(),
             $request->user(),
+            $request->filled('expected_quantity') ? $request->integer('expected_quantity') : null,
         );
 
         $movement = $result['movement'];

@@ -25,6 +25,7 @@ class AdjustInventoryRequest extends FormRequest
         return [
         'counted_quantity' => ['required', 'integer', 'min:0'],
         'reason' => ['required', 'string', 'max:255'],
+        'expected_quantity' => ['nullable', 'integer', 'min:0'],
         ];
     }
 }
