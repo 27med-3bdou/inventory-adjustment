@@ -1,66 +1,83 @@
-<p align="center"><a href="https://laravel.com" target="_blank"><img src="https://raw.githubusercontent.com/laravel/art/master/logo-lockup/5%20SVG/2%20CMYK/1%20Full%20Color/laravel-logolockup-cmyk-red.svg" width="400" alt="Laravel Logo"></a></p>
+# Inventory Adjustment API
 
-<p align="center">
-<a href="https://github.com/laravel/framework/actions"><img src="https://github.com/laravel/framework/workflows/tests/badge.svg" alt="Build Status"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/dt/laravel/framework" alt="Total Downloads"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/v/laravel/framework" alt="Latest Stable Version"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/l/laravel/framework" alt="License"></a>
-</p>
+Laravel API endpoint that lets an admin submit a physical stock count for an inventory item.
 
-## About Laravel
+## Setup
 
-Laravel is a web application framework with expressive, elegant syntax. We believe development must be an enjoyable and creative experience to be truly fulfilling. Laravel takes the pain out of development by easing common tasks used in many web projects, such as:
+```bash
+composer install
+cp .env.example .env
+php artisan key:generate
+# set DB_* in .env (MySQL)
+php artisan migrate
+```
 
-- [Simple, fast routing engine](https://laravel.com/docs/routing).
-- [Powerful dependency injection container](https://laravel.com/docs/container).
-- Multiple back-ends for [session](https://laravel.com/docs/session) and [cache](https://laravel.com/docs/cache) storage.
-- Expressive, intuitive [database ORM](https://laravel.com/docs/eloquent).
-- Database agnostic [schema migrations](https://laravel.com/docs/migrations).
-- [Robust background job processing](https://laravel.com/docs/queues).
-- [Real-time event broadcasting](https://laravel.com/docs/broadcasting).
+Tests use a separate MySQL database (`inventory_adjustment_testing`, set in `phpunit.xml`):
 
-Laravel is accessible, powerful, and provides tools required for large, robust applications.
+```bash
+php artisan test
+```
 
-## Learning Laravel
+## Endpoint
 
-Laravel has the most extensive and thorough [documentation](https://laravel.com/docs) and video tutorial library of all modern web application frameworks, making it a breeze to get started with the framework.
+`POST /api/inventories/{inventory}/adjustments` (Sanctum token, admin only)
 
-You may also try the [Laravel Bootcamp](https://bootcamp.laravel.com), where you will be guided through building a modern Laravel application from scratch.
+```json
+{
+  "counted_quantity": 9,
+  "reason": "Damaged items",
+  "expected_quantity": 12
+}
+```
 
-If you don't feel like reading, [Laracasts](https://laracasts.com) can help. Laracasts contains thousands of video tutorials on a range of topics including Laravel, modern PHP, unit testing, and JavaScript. Boost your skills by digging into our comprehensive video library.
+`expected_quantity` is optional (see Concurrency).
 
-## Laravel Sponsors
+| Status | Meaning |
+| --- | --- |
+| 201 | Stock adjusted and movement recorded |
+| 200 | Count matches current stock, nothing recorded |
+| 401 | Not authenticated |
+| 403 | Not an admin |
+| 404 | Inventory not found |
+| 409 | Stock changed since the admin last saw it |
+| 422 | Validation error |
 
-We would like to extend our thanks to the following sponsors for funding Laravel development. If you are interested in becoming a sponsor, please visit the [Laravel Partners program](https://partners.laravel.com).
+## Implementation Decisions
 
-### Premium Partners
+**The client sends the counted quantity, not the difference.** The server calculates `quantity_change = counted - current`, so the difference is always based on the real current value.
 
-- **[Vehikl](https://vehikl.com/)**
-- **[Tighten Co.](https://tighten.co)**
-- **[WebReinvent](https://webreinvent.com/)**
-- **[Kirschbaum Development Group](https://kirschbaumdevelopment.com)**
-- **[64 Robots](https://64robots.com)**
-- **[Curotec](https://www.curotec.com/services/technologies/laravel/)**
-- **[Cyber-Duck](https://cyber-duck.co.uk)**
-- **[DevSquad](https://devsquad.com/hire-laravel-developers)**
-- **[Jump24](https://jump24.co.uk)**
-- **[Redberry](https://redberry.international/laravel/)**
-- **[Active Logic](https://activelogic.com)**
-- **[byte5](https://byte5.de)**
-- **[OP.GG](https://op.gg)**
+**Atomicity.** Updating the quantity and creating the movement run inside one `DB::transaction()`. If either fails, both are rolled back. The transaction retries up to 3 times on deadlock.
 
-## Contributing
+**Concurrency: pessimistic locking.** Inside the transaction the row is read with `lockForUpdate()` (`SELECT ... FOR UPDATE`). If two admins adjust the same item at the same time, the second waits until the first commits, then calculates its difference from the updated quantity. This keeps the ledger consistent: `initial quantity + sum of movements = current quantity`.
 
-Thank you for considering contributing to the Laravel framework! The contribution guide can be found in the [Laravel documentation](https://laravel.com/docs/contributions).
+**Concurrency: stale count detection.** Locking prevents corrupted numbers, but on its own the last count simply wins. If the client sends `expected_quantity` (the stock shown to the admin before counting) and the stock has changed since, the API returns `409 Conflict` instead of silently overwriting another admin's adjustment. The check runs after the lock, against the real value.
 
-## Code of Conduct
+**Never negative, enforced in three places.** Validation (`min:0`), a guard in the service (for callers outside HTTP such as jobs or commands), and an `UNSIGNED` column in the database.
 
-In order to ensure that the Laravel community is welcoming to all, please review and abide by the [Code of Conduct](https://laravel.com/docs/contributions#code-of-conduct).
+**Audit trail.** `inventory_movements` is append-only (no `updated_at`). `created_by` is taken from the authenticated user, never from the request body. Foreign keys use `restrictOnDelete` so history can't be deleted with its inventory or user.
 
-## Security Vulnerabilities
+**Layers.** Authorization and validation in a Form Request, business logic in `InventoryAdjustmentService` (no HTTP dependency, reusable from jobs or commands), and a thin invokable controller.
 
-If you discover a security vulnerability within Laravel, please send an e-mail to Taylor Otwell via [taylor@laravel.com](mailto:taylor@laravel.com). All security vulnerabilities will be promptly addressed.
+## Assumptions
 
-## License
+- **Admin check:** a simple `is_admin` flag on `users`, checked through a Gate (`adjust-inventory`). In a production system with multiple roles I would use a roles/permissions package (e.g. `spatie/laravel-permission`); only the Gate definition would need to change.
+- **Products and warehouses:** `product_id` and `warehouse_id` are not foreign keys because those tables are outside the task's scope.
+- **Item lookup:** the endpoint uses the inventory id. The SKU (`BAG-001`) belongs to products; a SKU + warehouse lookup could be added.
+- **No-op counts:** if the counted quantity equals current stock, no movement is recorded.
+- **Quantities** are whole units.
+- **Reason** is free text (max 255). It could become a fixed list (damaged, lost, found, recount).
+- **Project structure:** given the task's size I kept Laravel's default structure. In a larger codebase I would group code by domain (e.g. `Inventory/`) or use a modular structure.
 
-The Laravel framework is open-sourced software licensed under the [MIT license](https://opensource.org/licenses/MIT).
+## Tests
+
+`tests/Feature/InventoryAdjustmentTest.php` covers:
+
+- The task scenario (12 → 9, movement of −3 with reason and admin)
+- Increase and no-change counts
+- Negative and missing input (422)
+- Guest (401) and non-admin (403)
+- Rollback: if creating the movement fails, the quantity is unchanged
+- Stale `expected_quantity` returns 409 and changes nothing
+- Ledger consistency across consecutive adjustments by different admins
+
+True parallel requests can't be reproduced reliably inside a single PHPUnit process. Locking was designed for MySQL/InnoDB and can be verified manually with two concurrent DB sessions.
