@@ -9,7 +9,7 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
 class InventoryMovement extends Model
 {
     Use HasFactory;
-
+    public const UPDATED_AT = null;
     protected $fillable = [
         'inventory_id',
         'quantity_change',
